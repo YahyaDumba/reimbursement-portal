@@ -1,12 +1,49 @@
 const express = require('express');
 const sql = require('mssql');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const fs = require('fs');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+
+const uploadDir = './uploads';
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir);
+}
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        cb(null, Date.now() + '-' + file.originalname);
+    }
+});
+
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB Limit
+    fileFilter: (req, file, cb) => {
+        // Allowed extensions
+        const fileTypes = /jpeg|jpg|png|pdf/;
+        const extName = fileTypes.test(path.extname(file.originalname).toLowerCase());
+        const mimeType = fileTypes.test(file.mimetype);
+
+        if (extName && mimeType) {
+            return cb(null, true);
+        } else {
+            cb(new Error('Only images (jpeg, jpg, png) and PDFs are allowed!'));
+        }
+    }
+});
 
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 const app = express();
+app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const dbConfig = {
     user: process.env.DB_USER,
@@ -19,11 +56,11 @@ const dbConfig = {
     }
 }
 
-const authenticateToken = (req,res,next) => {
+const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
-    if(!token){
+    if (!token) {
         return res.status(401).json({ message: 'Access denied. No token provided.' });
     }
 
@@ -51,20 +88,26 @@ app.get('/api/v1/status', (req, res) => {
 });
 
 app.post('/api/v1/auth/login', async (req, res) => {
-    const { username, password } = req.body;
+    const { username, password, role } = req.body;
+
     try {
         const pool = await sql.connect(dbConfig);
         const result = await pool.request()
             .input('username', sql.VarChar, username)
-            // .input('password', sql.VarChar, password)
             .query('SELECT * FROM Users WHERE username = @username');
 
         const user = result.recordset[0];
+
         if (!user) {
             return res.status(401).json({ message: 'Invalid credentials' });
         }
 
-        if (user.PasswordHash == password) {
+        if (user.Role !== role) {
+            return res.status(403).json({ message: 'Invalid role selection' });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.PasswordHash);
+        if (isMatch) {
             const token = jwt.sign({
                 id: user.UserID,
                 username: user.Username,
@@ -84,8 +127,10 @@ app.post('/api/v1/auth/login', async (req, res) => {
     }
 })
 
-app.post('/api/v1/claim',authenticateToken, async (req, res) => {
-    const { userId, amount, description, category } = req.body;
+app.post('/api/v1/claim', authenticateToken, upload.single('receipt'), async (req, res) => {
+    const userId = req.user.id; // from the JWT token
+    const { amount, description, category } = req.body;
+    const receiptPath = req.file ? req.file.path : null;
     try {
         const pool = await sql.connect(dbConfig);
         const result = await pool.request()
@@ -93,7 +138,8 @@ app.post('/api/v1/claim',authenticateToken, async (req, res) => {
             .input('amount', sql.Decimal(18, 2), amount)
             .input('description', sql.VarChar, description)
             .input('category', sql.VarChar, category)
-            .query(`INSERT INTO ReimbursementClaims (UserId, Amount, Description, Category) VALUES (@userId, @amount, @description, @category)`);
+            .input('receiptPath', sql.VarChar, receiptPath)
+            .query(`INSERT INTO ReimbursementClaims (UserId, Amount, Description, Category, ReceiptPath) VALUES (@userId, @amount, @description, @category, @receiptPath)`);
         res.status(201).json({ message: 'Claim submitted successfully' });
     }
     catch (err) {
@@ -102,30 +148,31 @@ app.post('/api/v1/claim',authenticateToken, async (req, res) => {
     }
 })
 
-app.get('/api/v1/claims/:userId',authenticateToken, async (req, res) => {
+app.get('/api/v1/claims/:userId', authenticateToken, async (req, res) => {
     const { userId } = req.params;
-    try{
+    try {
         const pool = await sql.connect(dbConfig);
         const result = await pool.request()
             .input('userId', sql.Int, userId)
             .query('SELECT * FROM ReimbursementClaims WHERE UserId = @userId');
-        res.json(result.recordset);
+        return res.json(result.recordset);
     }
-    catch(err){
+    catch (err) {
         console.error('Error fetching claims:', err);
-        res.status(500).json({ message: 'Failed to fetch claims' });
+        return res.status(500).json({ message: 'Failed to fetch claims' });
     }
 })
 
-app.patch('/api/v1/claim/:claimId', authenticateToken, async(req, res)=> {
-    const {claimId} = req.params;
-    const {status} = req.body;
+app.patch('/api/v1/claim/:claimId', authenticateToken, async (req, res) => {
+    const { claimId } = req.params;
+    const { status, comment } = req.body;
     try {
         const pool = await sql.connect(dbConfig);
         const result = await pool.request()
             .input('claimId', sql.Int, claimId)
             .input('status', sql.VarChar, status)
-            .query('UPDATE ReimbursementClaims SET Status = @status WHERE ClaimID = @claimId');
+            .input('comment', sql.VarChar, comment || null)
+            .query('UPDATE ReimbursementClaims SET Status = @status, ManagerComment = @comment, UpdatedDate = GETDATE() WHERE ClaimID = @claimId');
         return res.json({ message: 'Claim status updated' });
     } catch (error) {
         console.error('Error updating claim status:', error);
@@ -143,10 +190,30 @@ app.get('/api/v1/claims/all/pending', authenticateToken, async (req, res) => {
         const pool = await sql.connect(dbConfig);
         const result = await pool.request()
             .query("SELECT * FROM ReimbursementClaims WHERE Status = 'Pending' ORDER BY SubmittedDate ASC");
-        
+
         res.json(result.recordset);
     } catch (err) {
         res.status(500).json({ message: "Failed to fetch pending queue" });
+    }
+});
+
+app.delete('/api/v1/claim/:claimId', authenticateToken, async (req, res) => {
+    // SECURITY: Only managers can delete
+    if (req.user.role !== 'Manager' && req.user.role !== 'Admin') {
+        return res.status(403).json({ message: "Unauthorized to delete records" });
+    }
+
+    const { claimId } = req.params;
+
+    try {
+        const pool = await sql.connect(dbConfig);
+        await pool.request()
+            .input('claimId', sql.Int, claimId)
+            .query('DELETE FROM ReimbursementClaims WHERE ClaimID = @claimId');
+
+        res.json({ message: "Record deleted successfully" });
+    } catch (err) {
+        res.status(500).json({ message: "Delete failed" });
     }
 });
 
